@@ -3,16 +3,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers import GPT2Tokenizer
 
 #hyperparameters
-batch_size = 32
-block_size = 8
+batch_size = 32 # How many sentences are grouped together during training
+block_size = 8 # Sentence Length with which one does training. Maximum Context length == Block Size
 max_iters = 3000
 eval_interval = 300
 learning_rate = 3e-4
-n_embd = 32
+n_embd = 64 # Information about one word
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 print(device)
 eval_iters = 200
 n_head = 8
@@ -23,31 +24,45 @@ torch.manual_seed(1337)
 with open('books.txt', 'r', encoding= 'UTF -8') as f:
     text = f.read()
 print("input read")
-#chars
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
+
+tokens = tokenizer.tokenize(text)
+## Vocabulary in our context is the individual characters
+
+vocab_size = tokenizer.vocab_size
 print(vocab_size)
-#encoder decoder mapping
-stoi = {ch:i for i,ch in enumerate(chars)}
+
+
+#Encode and Decode our vocabulary to integers
+## Encode: String -> Integer
+## Decode: Integer -> String
+"""stoi = {ch:i for i,ch in enumerate(chars)}
 itos = {i:ch for i,ch in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
-decode = lambda i: ''.join(itos[l] for l in i)
+decode = lambda i: ''.join(itos[l] for l in i)"""
  
+
 #get train and test split
-data = torch.tensor(encode(text), dtype=torch.long)
+## First encode the whole data to integers
+## split that vector of integers into a train and test set
+data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 n = int(0.9*len(text))
 train_data = data[:n]
 val_data = data[n:]
 
+
+## Getting a random batch of training data with corresponding targets
 def get_batch(split):
     #generate a small batch of data of inputs x and y
     data = train_data if split == 'train' else val_data
+    #generate a random tensor of integers of batch size. 
+    #The elements of ix are the indices of the starting position of each block of this specific batch.
     ix = torch.randint(len(data)-block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix]).to(device)
     y = torch.stack([data[i+1:i+1+block_size] for i in ix]).to(device)
     return x, y
 
 xb, yb = get_batch('train')
+
 
 @torch.no_grad
 def estimate_loss():
@@ -90,8 +105,10 @@ class Head(nn.Module):
         B,T,C = x.shape
         k = self.key(x)
         q = self.query(x)
+         
         #compute attention scores 'affinities'
         wei = q @ k.transpose(-2,-1) * C**-0.5
+        print(wei.shape)
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-1e9'))
         wei = F.softmax(wei, dim = -1)
         wei = self.dropout(wei)
@@ -125,11 +142,14 @@ class Block(nn.Module):
         x = x+ self.ffwd(self.ln2(x))
         return x
 
-class BigramLanguageModel(nn.Module):
+class LanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+        # token_embedding_table stores a vector of size n_embd for each word in the vocabulary
         self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
+        # position_embedding_table stores a vector of size n_emd for each position that is possible. 
+        # Only positions which are possible are 0 -> Block size
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
             Block(n_embd, 4),
@@ -142,11 +162,15 @@ class BigramLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B,T = idx.shape
-        #idx and targets are both tensors of size B,T
+        #idx and targets are both tensors of size B,T. 
+        # Essentially: B = Batch Size and T = Block Size. One also refers to T as the Sequence Length
+        # token_embd is now the 3-dimensional tensor (B,T,C) and now stores the embeddings of each element in the idx that we have.
         token_embd = self.token_embedding_table(idx) # (B,T,C)
         pos_embd = self.position_embedding_table(torch.arange(T, device=device))
         x = token_embd + pos_embd
+        
         x = self.blocks(x)
+        
         logits = self.lm_head(x)
 
         if targets is None:
@@ -173,7 +197,8 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx,idx_next), dim = 1) # (B, T+1)
         return idx
 
-model = BigramLanguageModel()
+model = LanguageModel()
+
 m = model.to(device)
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 

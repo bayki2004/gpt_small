@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 #hyperparameters
 batch_size = 32
@@ -20,11 +21,12 @@ n_layer = 6
 dropout = 0.2
 torch.manual_seed(1337)
 
-with open('books.txt', 'r', encoding= 'UTF -8') as f:
-    text = f.read()
 
-#chars
-chars = sorted(list(set(text)))
+df = pd.read_csv('gutenberg_data_with_text.csv', nrows=100)
+df = df.drop(labels=['Link'], axis=1)
+df['encoder_input'] = df['Title'] + " " + df['Author'] + " " + df['Bookshelf']
+df = df[~df['encoder_input'].isna()]
+chars = sorted(list(set(' '.join(df['encoder_input'].astype(str).values) + ' '.join(df['Text'].astype(str).values))))
 vocab_size = len(chars)
 print(vocab_size)
 #encoder decoder mapping
@@ -33,21 +35,31 @@ itos = {i:ch for i,ch in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda i: ''.join(itos[l] for l in i)
  
-#get train and test split
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(text))
-train_data = data[:n]
-val_data = data[n:]
 
-def get_batch(split):
-    #generate a small batch of data of inputs x and y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data)-block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix]).to(device)
-    y = torch.stack([data[i+1:i+1+block_size] for i in ix]).to(device)
+max_length = 512  # Or any other fixed length you'd like to use
+
+
+# Convert the data into tokenized format
+train_data = []
+for idx, row in df.iterrows():
+    encoder_input = encode(row['encoder_input'])
+    decoder_input = encode(row['Text'])
+    train_data.append((torch.tensor(encoder_input), torch.tensor(decoder_input)))
+
+def get_batch():
+    # Randomly pick a sample
+    ix = torch.randint(len(train_data), (batch_size,))
+    encoder_inputs = [train_data[i][0] for i in ix]
+    decoder_inputs = [train_data[i][1] for i in ix]
+    # Pad the sequences to the same length
+    x = pad_sequence(encoder_inputs, batch_first=True, padding_value=0).to(device)
+    y = pad_sequence(decoder_inputs, batch_first=True, padding_value=0).to(device)
     return x, y
 
-xb, yb = get_batch('train')
+xb, yb = get_batch()
+print(xb.shape, yb.shape)
+block_size_encoder = xb.shape[-1]
+print(block_size_encoder)
 
 @torch.no_grad
 def estimate_loss():
@@ -135,6 +147,7 @@ class Encoder(nn.Module):
     
     def forward(self, src):
         B, T = src.shape
+        print(B,T)
         token_emb = self.token_embedding(src)  # (B, T, n_embd)
         pos_emb = self.position_embedding(torch.arange(T, device=device))  # (T, n_embd)
         x = token_emb + pos_emb  # (B, T, n_embd)
@@ -177,7 +190,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 print('starting training')
 for iter in range(max_iters):
     model.train()
-    xb_src, yb_tgt = get_batch('train')  # `src` and `tgt` batches
+    xb_src, yb_tgt = get_batch()  # `src` and `tgt` batches
     logits = model(xb_src, yb_tgt)
     
     B, T, C = logits.shape
@@ -196,8 +209,8 @@ for iter in range(max_iters):
 
 
 print('done with training')
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-print(decode(model.generate(context, max_new_tokens=100)[0].tolist()))
+"""context = torch.zeros((1,1), dtype=torch.long, device=device)
+print(decode(model.generate(context, max_new_tokens=100)[0].tolist()))"""
 
  
 
