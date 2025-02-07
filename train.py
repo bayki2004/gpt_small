@@ -3,17 +3,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GPT2Tokenizer
 
 #hyperparameters
-batch_size = 32 # How many sentences are grouped together during training
-block_size = 8 # Sentence Length with which one does training. Maximum Context length == Block Size
+batch_size = 64 # How many sentences are grouped together during training
+block_size = 32 # Sentence Length with which one does training. Maximum Context length == Block Size
 max_iters = 3000
 eval_interval = 300
-learning_rate = 3e-4
+learning_rate = 1e-4
 n_embd = 64 # Information about one word
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 print(device)
 eval_iters = 200
 n_head = 8
@@ -25,31 +23,32 @@ with open('books.txt', 'r', encoding= 'UTF -8') as f:
     text = f.read()
 print("input read")
 
-tokens = tokenizer.tokenize(text)
-## Vocabulary in our context is the individual characters
 
-vocab_size = tokenizer.vocab_size
+## Vocabulary in our context is the individual characters
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
 print(vocab_size)
 
 
 #Encode and Decode our vocabulary to integers
 ## Encode: String -> Integer
 ## Decode: Integer -> String
-"""stoi = {ch:i for i,ch in enumerate(chars)}
+stoi = {ch:i for i,ch in enumerate(chars)}
 itos = {i:ch for i,ch in enumerate(chars)}
 encode = lambda s: [stoi[c] for c in s]
-decode = lambda i: ''.join(itos[l] for l in i)"""
+decode = lambda i: ''.join(itos[l] for l in i)
  
 
 #get train and test split
 ## First encode the whole data to integers
 ## split that vector of integers into a train and test set
-data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+data = torch.tensor(encode(text), dtype=torch.long)
+data = data.to(device)
 n = int(0.9*len(text))
 train_data = data[:n]
 val_data = data[n:]
 
-
+print(train_data.shape, val_data.shape, vocab_size)
 ## Getting a random batch of training data with corresponding targets
 def get_batch(split):
     #generate a small batch of data of inputs x and y
@@ -108,7 +107,6 @@ class Head(nn.Module):
          
         #compute attention scores 'affinities'
         wei = q @ k.transpose(-2,-1) * C**-0.5
-        print(wei.shape)
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-1e9'))
         wei = F.softmax(wei, dim = -1)
         wei = self.dropout(wei)
