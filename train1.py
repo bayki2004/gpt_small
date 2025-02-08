@@ -1,42 +1,41 @@
 import pandas as pd
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers import GPT2Tokenizer
 
 # Hyperparameters
-batch_size = 64
-block_size = 32
+batch_size = 16
+block_size = 128  # Increase block size for better context
 max_iters = 3000
-eval_iters = 100
 eval_interval = 300
 learning_rate = 1e-4
-n_embd = 64
+n_embd = 256
 n_head = 8
 n_layer = 4
 dropout = 0.2
-device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.manual_seed(1337)
 
 # Load dataset
 df = pd.read_csv('gutenberg_data_with_text.csv', nrows=10)  # Replace with your actual CSV file name
 df = df.dropna(subset=['Author', 'Text'])  # Ensure there are no missing values
 
-# Prepare the combined text: "Author: <author_name>\nText: <text>"
+# Prepare text data: "Author: <author_name>\nText: <text>"
 texts = ["Author: " + row['Author'] + "\nText: " + row['Text'] for _, row in df.iterrows()]
 combined_text = '\n'.join(texts)
 
-# Build vocabulary
-chars = sorted(list(set(combined_text)))
-vocab_size = len(chars)
+# Tokenizer setup using GPT2Tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token  # Ensure padding token exists
+vocab_size = tokenizer.vocab_size
+# Truncate sequences that exceed the maximum length
+max_length = tokenizer.model_max_length  # Default is 1024 for GPT-2
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join(itos[i] for i in l)
+# Encode text
+data = tokenizer.encode(combined_text, truncation=True, padding=True, max_length=max_length)
+data = torch.tensor(data, dtype=torch.long).to(device)
 
-# Encode the entire text and split into train/validation sets
-data = torch.tensor(encode(combined_text), dtype=torch.long).to(device)
 n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
@@ -55,8 +54,8 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        losses = torch.zeros(eval_interval)
+        for k in range(eval_interval):
             X, Y = get_batch(split)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -64,7 +63,7 @@ def estimate_loss():
     model.train()
     return out
 
-# Transformer model components
+# Transformer model components (unchanged)
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
@@ -84,7 +83,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size, device=device)))
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -103,7 +102,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.proj = nn.Linear(num_heads * head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -119,7 +118,7 @@ class Block(nn.Module):
         self.ffwd = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-    
+
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
@@ -165,7 +164,7 @@ class LanguageModel(nn.Module):
 # Initialize and train the model
 model = LanguageModel().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
+print("starting training")
 for iter in range(max_iters):
     if iter % eval_interval == 0:
         losses = estimate_loss()
@@ -179,6 +178,8 @@ for iter in range(max_iters):
     optimizer.step()
 
 # Generate text conditioned on an author
-context = torch.tensor(encode("Author: AuthorX\nText: "), dtype=torch.long).unsqueeze(0).to(device)
-generated_text = decode(model.generate(context, max_new_tokens=500)[0].tolist())
+prompt = "Author: AuthorX\nText: "
+context = torch.tensor(tokenizer.encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
+generated_ids = model.generate(context, max_new_tokens=200)[0].tolist()
+generated_text = tokenizer.decode(generated_ids)
 print(generated_text)
