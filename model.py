@@ -1,0 +1,136 @@
+import torch
+import numpy as np
+import torch.nn as nn
+from torch.nn import functional as F
+from dataclasses import dataclass
+import math
+
+
+# Transformer model components (unchanged)
+class FeedForward(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd * 4),
+            nn.ReLU(),
+            nn.Linear(config.n_embd * 4, config.n_embd),
+            nn.Dropout(config.dropout)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Head(nn.Module):
+    def __init__(self, head_size, config):
+        super().__init__()
+        self.key = nn.Linear(config.n_embd, head_size, bias=config.bias)
+        self.query = nn.Linear(config.n_embd, head_size, bias=config.bias)
+        self.value = nn.Linear(config.n_embd, head_size, bias=config.bias)
+        self.register_buffer('tril', torch.tril(torch.ones(config.block_size, config.block_size)))
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-1e9'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        v = self.value(x)
+        out = wei @ v
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self,  head_size, config):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size, config) for _ in range(config.n_head)])
+        self.proj = nn.Linear(config.n_head * head_size, config.n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        head_size = config.n_embd // config.n_head
+        self.sa = MultiHeadAttention( head_size, config)
+        self.ffwd = FeedForward(config)
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+@dataclass
+class ModelConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 config.vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True
+
+class LanguageModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.config = config
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        device = idx.device
+        token_embd = self.token_embedding_table(idx)
+        pos_embd = self.position_embedding_table(torch.arange(T, device=device))
+        x = token_embd + pos_embd
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, - self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+    def compute_log_probability(self, x, y):
+        log_prob = 0.0
+        idx = x  # Start with the given prefix x
+        y_len = y.size(1)
+        
+        for i in range(y_len):
+            idx_cond = idx[:, -self.config.block_size:]  # Truncate to block size
+            logits, _ = self(idx_cond)  # Get logits
+            logits = logits[:, -1, :]  # Get logits for the last token in the sequence
+            probs = F.softmax(logits, dim=-1)  # Convert logits to probabilities
+            
+            y_next = y[:, i]  # The next token from the target sequence y
+            token_prob = probs[:, y_next].item()  # Get the probability of generating y_next
+            log_prob += math.log(token_prob + 1e-9)  # Add log probability (avoid log(0) with 1e-9)
+            
+            idx = torch.cat((idx, y_next.unsqueeze(1)), dim=1)  # Append y_next to the sequence
+        
+        return log_prob

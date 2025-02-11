@@ -2,3 +2,6 @@ books.txt
 books_large.txt
 gutenberg_data_with_text.csv
 books_text_xl.txt
+data/
+models/
+
