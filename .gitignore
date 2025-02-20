@@ -4,4 +4,5 @@ gutenberg_data_with_text.csv
 books_text_xl.txt
 data/
 models/
+out/
 

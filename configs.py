@@ -33,3 +33,4 @@ llm_1 = {
     "dropout": 0.2
     
 }
+llm_4 = {"n_embd": 768, "n_head": 8, "n_layer": 4, "dropout": 0.0, "bias": False, "vocab_size": 50257, "block_size": 512}
