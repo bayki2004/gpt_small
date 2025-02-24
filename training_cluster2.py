@@ -13,18 +13,18 @@ from torch.optim.lr_scheduler import StepLR
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Hyperparametsers
-batch_size = 8
-block_size = 8  # Increase block size for better context
-max_iters = 30000
-eval_interval = 2000
-eval_iters = 1
+batch_size = 32
+block_size = 256  # Increase block size for better context
+max_iters = 10000
+eval_interval = 300
+eval_iters = 2
 learning_rate = 3e-4
 n_embd = 768
 n_head = 8
 n_layer = 4
 dropout = 0.0
 vocab_size = 50257  # GPT2 vocab size
-init_from = 'scratch'
+init_from = 'resume'
 bias = False
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 decay_lr = True # whether to decay the learning rate
@@ -35,17 +35,19 @@ grad_clip = 1.0
 enc = tiktoken.get_encoding("gpt2")
 gradient_accumulation_steps = 5 * 5 # used to simulate larger batch sizes
 outdir = os.path.join(os.path.dirname(__file__), "out")
-model_dir = os.path.join(outdir, "models")
-description = f"{block_size}_{learning_rate}"
-save_checkpoints = False
+model_dir = os.path.join(os.path.dirname(__file__), "models")
+
+save_checkpoints = True
 learning_rates = []
 training_losses = []
 validation_losses = []
+simple_learning_rate = True
+description = f"{block_size}_{max_iters}_{simple_learning_rate}_{init_from}"
 
 device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 print(device)
-print(max_iters, block_size, batch_size, learning_rate, n_embd)
+print("Model args", max_iters, block_size, batch_size, learning_rate, n_embd, n_head, n_layer)
 
 
 # Function to get a batch of data
@@ -89,6 +91,7 @@ def estimate_loss():
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
+            print(k, loss.item())
         out[split] = losses.mean().item()
     model.train()
     return out
@@ -114,7 +117,7 @@ print(config)
 if init_from == 'scratch':
     model = LanguageModel(config).to(device)
 elif init_from == 'resume':
-    ckpt_path = os.path.join(outdir, 'best_model.pth')
+    ckpt_path = os.path.join(model_dir, 'lm_512_30000_True_end.pth')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -133,10 +136,12 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
+    iter_num = 0
     best_val_loss = checkpoint['best_val_loss']
+    best_val_loss = 1e9
     training_losses = checkpoint['training_losses']
     validation_losses = checkpoint['validation_losses']
-    learning_rates = checkpoint['learning_rates']
+    
 else:
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
@@ -157,6 +162,8 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 #scheduler = StepLR(optimizer, step_size=1000, gamma=0.1)  # Reduces LR by 10x every 1000 steps
 scheduler = CosineAnnealingLR(optimizer, T_max=lr_decay_iters, eta_min=min_lr)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate, 
+                                                total_steps=max_iters, pct_start=0.3)
 
 
 
@@ -172,7 +179,7 @@ if __name__ == "__main__":
             losses = estimate_loss()
             val_loss = losses['val']
             validation_losses.append(val_loss)
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             
             if math.isnan(val_loss) or math.isnan(losses['train']) or current_val_loss<val_loss:
                 assert False, 'diverging'
@@ -184,49 +191,59 @@ if __name__ == "__main__":
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'model_args': model_args,
-                        'iter_num': iter,
+                        'iter_num': iter_num,
                         'current_loss': losses['train'],
                         'best_val_loss': val_loss,
                         'learning_rates': learning_rates,
                         'training_losses': training_losses,
                         'validation_losses': validation_losses,
+                        'simple_learning_rate': simple_learning_rate,
                     }
                     print('saving checkpoint at intermediate models')
                     if save_checkpoints:
-                        torch.save(checkpoint, os.path.join(outdir, f"checkpoint_{description}.pt"))
-        with torch.amp.autocast('cuda'):
+                        torch.save(checkpoint, os.path.join(outdir, f"ckpt_{description}.pt"))
+        
+        if simple_learning_rate:
             logits, loss = model(xb, yb)
-        scaler.scale(loss).backward()
-        for micro_step in range(gradient_accumulation_steps): 
-            with ctx:
+            optimizer.zero_grad(set_to_none=True)
+            loss_ = loss.item()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        else:
+            with torch.amp.autocast('cuda'):
                 logits, loss = model(xb, yb)
-                loss = loss / gradient_accumulation_steps
-            xb,yb = get_batch('train')
             scaler.scale(loss).backward()
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
-
-        loss_ = loss.item() * gradient_accumulation_steps
-        print(loss_)
+            for micro_step in range(gradient_accumulation_steps): 
+                with ctx:
+                    logits, loss = model(xb, yb)
+                    loss = loss / gradient_accumulation_steps
+                xb,yb = get_batch('train')
+                scaler.scale(loss).backward()
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.zero_grad(set_to_none=True)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            loss_ = loss.item() * gradient_accumulation_steps
         training_losses.append(loss_)
+        print(iter_num, loss_)
         learning_rates.append(optimizer.param_groups[0]['lr'])
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         iter_num += 1
+
     checkpoint = {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'model_args': model_args,
-        'iter_num': iter,
+        'iter_num': iter_num,
         'current_loss': loss_,
         'best_val_loss': best_val_loss,
         'learning_rates': learning_rates,
         'training_losses': training_losses,
         'validation_losses': validation_losses,
+        'simple_learning_rate': simple_learning_rate,
     }
     if save_checkpoints:
         torch.save(checkpoint, os.path.join(model_dir, f'lm_{description}_end.pth'))
