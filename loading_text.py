@@ -10,6 +10,8 @@ delimiter = "*** START OF THE PROJECT GUTENBERG EBOOK"
 chunk_size = 1000  # Number of rows to read in each chunk
 end_of_text = "*** END OF THE PROJECT GUTENBERG EBOOK"
 max_prompt_length = 0
+small_samples = True
+no_duplicates = True
 def extract_text_between_markers(text):
     start_idx = text.find(delimiter)
     end_idx = text.find(end_of_text)
@@ -54,6 +56,8 @@ def write_to_bin_file_in_chunks(csv_file, filename, batch_size=1000):
 
     for chunk in pd.read_csv(csv_file, chunksize=chunk_size):
         chunk = chunk.dropna(subset=['Author', 'Text'])
+        if no_duplicates:
+            chunk = chunk.drop_duplicates(subset=['Author'], keep='first')
         train_chunk, val_chunk = train_test_split(chunk, test_size=0.0005, random_state=2357, shuffle=True)
 
         for dataframe, split_name in [(train_chunk, "train"), (val_chunk, "val")]:
