@@ -9,43 +9,34 @@ enc = tiktoken.get_encoding("gpt2")
 delimiter = "*** START OF THE PROJECT GUTENBERG EBOOK"
 chunk_size = 1000  # Number of rows to read in each chunk
 end_of_text = "*** END OF THE PROJECT GUTENBERG EBOOK"
-max_prompt_length = 0
+max_text_length = 64
 small_samples = True
-no_duplicates = True
+only_text = False
 def extract_text_between_markers(text):
     start_idx = text.find(delimiter)
     end_idx = text.find(end_of_text)
 
     if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-        extracted_text = text[start_idx+ len(delimiter): end_idx-10000].strip()
+        extracted_text = text[start_idx+ len(delimiter): end_idx].strip()
         #print(len(extracted_text), len(enc.encode_ordinary(extracted_text)))
         return extracted_text
-    return None  # Return None if markers are missing
+    return text  # Return None if markers are missing
 
-authors = set()
-i, j = 0, 0
+
 # Generator function for processing rows within a chunk
 def process_generator(dataframe):
-    global authors, i, j
     for _, example in dataframe.iterrows():
-        text = extract_text_between_markers(example['Text'])
-        combined_text = f"{example['Author']} <> {text}"
-        if authors.intersection({example['Author']}):
-            print(example['Author'])
-            i = 1 +i
-            print(i)
-            continue
-        j = 1 +j
-        
-        authors.add(example['Author'])
-
-        author_encoded = enc.encode(example['Author'])
-        
-        combined_text = enc.encode(f" <> {text}")
-        combined_text = author_encoded + combined_text
-        ids = (combined_text[:len(author_encoded)+20])
+        author_str = example['Author']
+        author_encoded = enc.encode(author_str)
+        text_str = example['Text']
+        text_encoded = enc.encode(text_str)
+        if small_samples:
+            text_encoded = text_encoded[:max_text_length]
+        combined_text = author_encoded + text_encoded
+        if only_text:
+            combined_text = text_encoded
+        ids = combined_text
         ids.append(enc.eot_token)
-        
         yield ids
 
 
@@ -56,8 +47,6 @@ def write_to_bin_file_in_chunks(csv_file, filename, batch_size=1000):
 
     for chunk in pd.read_csv(csv_file, chunksize=chunk_size):
         chunk = chunk.dropna(subset=['Author', 'Text'])
-        if no_duplicates:
-            chunk = chunk.drop_duplicates(subset=['Author'], keep='first')
         train_chunk, val_chunk = train_test_split(chunk, test_size=0.0005, random_state=2357, shuffle=True)
 
         for dataframe, split_name in [(train_chunk, "train"), (val_chunk, "val")]:
@@ -65,7 +54,7 @@ def write_to_bin_file_in_chunks(csv_file, filename, batch_size=1000):
                 continue
             for ids in tqdm(process_generator(dataframe), desc=f'Processing {split_name} chunk'):
                 all_ids.extend(ids)  # Accumulate all tokenized data
-        print(f"processed {split_name}")
+            print(f"processed {split_name}")
     # Convert the accumulated list to a NumPy array and save it using np.memmap
     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(len(all_ids),))
     arr[:] = all_ids
@@ -73,7 +62,5 @@ def write_to_bin_file_in_chunks(csv_file, filename, batch_size=1000):
 
 if __name__ == "__main__":
 # Run the preprocessing and write to binary files
-    write_to_bin_file_in_chunks("data/gutenberg_data_with_text.csv", "train_small_2.bin")
-    write_to_bin_file_in_chunks("data/gutenberg_data_with_text.csv", "val_small_2.bin")
-    print(max_prompt_length)
-    print(i, j)
+    write_to_bin_file_in_chunks("data/data_no_dup.csv", "data/train_no_dup_small.bin")
+    write_to_bin_file_in_chunks("data/data_no_dup.csv", "data/val_no_dup_small.bin")
