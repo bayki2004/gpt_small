@@ -1,281 +1,220 @@
+from encoder_decoder import *
 import torch
-import numpy as np
-import pandas as pd
 import torch.nn as nn
-from torch.nn import functional as F
-import tiktoken
-from tqdm import tqdm
-from dataclasses import dataclass
-from encoder_decoder import ModelConfig, EncoderDecoder
-import os
-import time
-import random
+import torch.optim as optim
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from transformers import T5Tokenizer
 
-# Hyperparameters
-batch_size = 32
-block_size = 32  # Context length for both encoder and decoder
-max_iters = 5000
-eval_interval = 300
-learning_rate = 3e-4
-n_embd = 768
-n_head = 8
-n_encoder_layer = 12
-n_decoder_layer = 12
-dropout = 0.0
-vocab_size = 50257  # GPT2 vocab size
-bias = False
-enc = tiktoken.get_encoding("gpt2")
+# Assume config is defined as per your ModelConfig
+config = ModelConfig()  # defaults: block_size=1024, vocab_size=50304, n_layer=12, n_head=12, n_embd=768, dropout=0.0, bias=True
 
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
-outdir = os.path.join(os.path.dirname(__file__), "out")
-model_dir = os.path.join(os.path.dirname(__file__), "models")
-data_name = ""
-init_from = 'scratch'  # 'scratch' or 'resume'
-resume_from = 'encdec_512_30000_True_end.pth'
-description = f"{block_size}_{init_from}_{data_name}"
+# Instantiate the encoder-decoder model with your pretrained encoder (BERT)
+model = EncoderDecoderModel(config, t5_encoder, encoder_proj)
+for param in model.encoder.parameters():
+    param.requires_grad = False
 
-# Special tokens
-PAD_TOKEN_ID = 0  # Assuming 0 is reserved for padding
-BOS_TOKEN_ID = 1  # Beginning of sequence
-EOS_TOKEN_ID = 2  # End of sequence
+model.train()
 
-device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-device_type = 'cuda' if 'cuda' in device else 'cpu'
-print(f"Using device: {device}")
+# Create a simple optimizer
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-data_dir = os.path.join(os.path.dirname(__file__), 'data')
-df = pd.read_csv('data/data_no_dup.csv', nrows=100)
-df = df.dropna(subset=['Author', 'Text'])
-train_src_data = df.loc[:90]['Author'].values
-train_tgt_data = df.loc[:90]['Text'].values
-val_src_data = df.loc[91:]['Author'].values
-val_tgt_data = df.loc[91:]['Text'].values
 
-# Function to get a batch of data for encoder-decoder
-def get_batch(split):
-    if split == 'train':
-        src_data = train_src_data
-        tgt_data = train_tgt_data
+num_epochs = 3
+batch_size = 3
+encoder_seq_len = 10   # length of source sequences
+decoder_seq_len = 8 
+start_token_id = 101
+
+
+# Assume you saved your decoder-only model's state dict in 'decoder_state_dict.pth'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+saved_decoder_state = torch.load("models/lm_32_scratch_indices_end.pth", map_location=device)
+
+# Inspect the keys (for example purposes)
+print("Saved state keys:", saved_decoder_state.keys())
+
+# Create a new dictionary to hold the mapped weights for the new model.
+mapped_decoder_state = {}
+
+# Suppose your old decoder model had these keys:
+#   "token_embedding_table", "position_embedding_table", "blocks.0.ln1.weight", "blocks.0.ln1.bias", etc.
+# And your new model expects:
+#   "decoder_token_embedding.weight", "decoder_position_embedding.weight", "decoder_blocks.0.ln1.weight", etc.
+saved_decoder_state = saved_decoder_state['model']
+for k, v in saved_decoder_state.items():
+    # Map token embedding table:
+    print(k,v.shape)
+    if k.startswith("token_embedding_table"):
+        new_key = k.replace("token_embedding_table", "decoder_token_embedding")
+        mapped_decoder_state[new_key] = v
+    # Map position embedding table:
+    elif k.startswith("position_embedding_table"):
+        new_key = k.replace("position_embedding_table", "decoder_position_embedding")
+        mapped_decoder_state[new_key] = v
+    # Map the transformer blocks:
+    elif k.startswith("blocks"):
+        # For example, "blocks.0.ln1.weight" becomes "decoder_blocks.0.ln1.weight"
+        new_key = "decoder_blocks" + k[len("blocks"):]
+        mapped_decoder_state[new_key] = v
+    # Map the final layer norm and LM head directly if names are unchanged:
     else:
-        src_data = val_src_data
-        tgt_data = val_tgt_data
+        # e.g. "ln_f" and "lm_head" may be the same.
+        mapped_decoder_state[k] = v
 
-    # Create batches for source and target
-    src_batch = []
-    tgt_batch = []
-    tgt_y_batch = []
-    max_src_len = 0
-    max_tgt_len = 0
-    max_seq_len = 32  # Choose an appropriate value
+# Now, instantiate your new encoder–decoder model.
+print('done')
+model = EncoderDecoderModel(config, t5_encoder, encoder_proj)
 
-    for _ in range(batch_size):
-        # For simplicity, we'll assume src_data and tgt_data are paired
-        # In a real implementation, you'd need to ensure proper alignment
-        src_idx = random.randint(0, len(src_data) - block_size - 1)
-        
-        # Get source sequence (encoder input)
-        src_seq = src_data[src_idx:src_idx + block_size][0]
-        
-        src_seq = enc.encode(src_seq)
-        src_seq = np.array(src_seq).astype(np.int64)
-        # Trim to actual content by finding EOS token or taking full length
-        eos_positions = np.where(src_seq == EOS_TOKEN_ID)[0]
-        if len(eos_positions) > 0:
-            src_len = eos_positions[0] + 1  # Include the EOS token
-            src_seq = src_seq[:src_len]
-        else:
-            src_len = len(src_seq)
-        max_src_len = max(max_src_len, src_len)
-        
-        # Get corresponding target sequence
-        tgt_idx = random.randint(0, len(tgt_data) - block_size - 1)
-        tgt_seq = tgt_data[tgt_idx:tgt_idx + block_size][0]
-        tgt_seq = enc.encode(tgt_seq)
-        tgt_seq = np.array(tgt_seq).astype(np.int64)
-        # Add BOS at the beginning
-        tgt_seq = np.concatenate(([BOS_TOKEN_ID], tgt_seq))
-        # Trim to actual content
-        eos_positions = np.where(tgt_seq == EOS_TOKEN_ID)[0]
-        if len(eos_positions) > 0:
-            tgt_len = eos_positions[0] + 1  # Include the EOS token
-            tgt_seq = tgt_seq[:tgt_len]
-        else:
-            tgt_len = len(tgt_seq)
-        max_tgt_len = max(max_tgt_len, tgt_len)
-        
-        # Create target for loss computation (shifted right)
-        tgt_seq = tgt_seq[:min(len(tgt_seq), max_seq_len)]
-        tgt_y = tgt_seq[1:]  # Target is input shifted by 1
-        tgt_seq = tgt_seq[:-1]  # Input is everything except the last token
-        
-        src_batch.append(src_seq)
-        tgt_batch.append(tgt_seq)
-        tgt_y_batch.append(tgt_y)
+# Freeze the encoder parameters, if not already frozen.
+for param in model.encoder.parameters():
+    param.requires_grad = False
+
+model.to(device)
+model.train()
+
+# Get the current state dict of the new model.
+new_state = model.state_dict()
+
+# Update only the decoder parts with the mapped weights.
+new_state.update(mapped_decoder_state)
+
+# Load the updated state dict into the model.
+model.load_state_dict(new_state)
+
+print("Loaded pretrained decoder weights into the encoder-decoder model.")
+
+# Now you can continue training with the encoder frozen.
+optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+
+
+
+# --- Sample DataFrame ---
+df = pd.read_csv('data/sample.csv')
+
+# --- Set sequence lengths ---
+encoder_seq_len = 10
+decoder_seq_len = 12
+
+# --- Initialize T5 tokenizer ---
+tokenizer = T5Tokenizer.from_pretrained('t5-small')
+# Use T5 encoder's decoder_start_token_id if available; otherwise fallback to pad_token_id.
+decoder_start_token_id = t5_encoder.config.decoder_start_token_id
+if decoder_start_token_id is None:
+    decoder_start_token_id = tokenizer.pad_token_id
+
+# --- Create a custom dataset ---
+class AuthorTextDataset(Dataset):
+    def __init__(self, df, tokenizer, encoder_seq_len, decoder_seq_len, decoder_start_token_id):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.encoder_seq_len = encoder_seq_len
+        self.decoder_seq_len = decoder_seq_len
+        self.decoder_start_token_id = decoder_start_token_id
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        author = row['Author']
+        text = row['Text']
+        # Tokenize encoder input (Author)
+        encoder_enc = self.tokenizer(
+            author,
+            padding='max_length',
+            max_length=self.encoder_seq_len,
+            truncation=True,
+            return_tensors='pt'
+        )
+        # Tokenize decoder target (Text)
+        decoder_enc = self.tokenizer(
+            text,
+            padding='max_length',
+            max_length=self.decoder_seq_len,
+            truncation=True,
+            return_tensors='pt'
+        )
+        encoder_input_ids = encoder_enc['input_ids'].squeeze(0)  # shape: (encoder_seq_len,)
+        full_decoder_targets = decoder_enc['input_ids'].squeeze(0)  # shape: (decoder_seq_len,)
+
+        # Create shifted decoder inputs: prepend the start token and drop the last token.
+        decoder_input_ids = torch.cat(
+            [torch.tensor([self.decoder_start_token_id]), full_decoder_targets[:-1]],
+            dim=0
+        )
+        return encoder_input_ids, decoder_input_ids, full_decoder_targets
+
+
+class PreprocessedDataset(Dataset):
+    def __init__(self, data_tuples, decoder_start_token_id):
+        self.data = data_tuples
+        self.decoder_start_token_id = decoder_start_token_id
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Unpack the tuple: encoder tensor and full target sentence tensor.
+        encoder_input_ids, full_decoder_targets = self.data[idx]
+        # Create shifted decoder input: prepend start token and remove the last token.
+        decoder_input_ids = torch.cat(
+            [torch.tensor([self.decoder_start_token_id], dtype=torch.long), full_decoder_targets[:-1]]
+        )
+        return encoder_input_ids, decoder_input_ids, full_decoder_targets
+
+# Create dataset and dataloader (batch_size can be adjusted)
+dataset = AuthorTextDataset(df, tokenizer, encoder_seq_len, decoder_seq_len, decoder_start_token_id)
+dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+train_dataset = PreprocessedDataset(training_tuples, decoder_start_token_id)
+val_dataset = PreprocessedDataset(validation_tuples, decoder_start_token_id)
+
+batch_size = 2  # adjust as needed
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+# --- Training Setup ---
+num_epochs = 5
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = 'mps'
+model.to(device)
+print(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+# --- Training Loop ---
+for epoch in range(num_epochs):
+    running_loss = 0.0
+    for batch in dataloader:
+        encoder_input_ids, decoder_input_ids, decoder_targets = batch
+        # Move tensors to device
+        encoder_input_ids = encoder_input_ids.to(device)
+        decoder_input_ids = decoder_input_ids.to(device)
+        decoder_targets = decoder_targets.to(device)
+        print(encoder_input_ids.shape, decoder_input_ids.shape, decoder_targets.shape)
+        print(tokenizer.decode(encoder_input_ids[0].squeeze().to(device), skip_special_tokens=True))
+        print(tokenizer.decode(decoder_input_ids[0].squeeze().to(device), skip_special_tokens=True)) 
+        optimizer.zero_grad()
+        logits, loss = model(encoder_input_ids, decoder_input_ids, decoder_targets)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
     
-    # Pad sequences to the max length in the batch
-    src_tensor = torch.zeros((batch_size, max_src_len), dtype=torch.long)
-    tgt_tensor = torch.zeros((batch_size, max_seq_len-1), dtype=torch.long)  # -1 because we removed the last token
-    tgt_y_tensor = torch.zeros((batch_size, max_seq_len-1), dtype=torch.long)
-    
-    # Create padding masks
-    src_mask = torch.zeros((batch_size, 1, 1, max_src_len), dtype=torch.bool)
-    tgt_mask = torch.zeros((batch_size, 1, 1, max_seq_len-1), dtype=torch.bool)
-    
-    for i in range(batch_size):
-        src_len = len(src_batch[i])
-        tgt_len = len(tgt_batch[i])
-        tgt_y_len = len(tgt_y_batch[i])
-        
-        src_tensor[i, :src_len] = torch.tensor(src_batch[i])
-        tgt_tensor[i, :tgt_len] = torch.tensor(tgt_batch[i])
-        tgt_y_tensor[i, :tgt_y_len] = torch.tensor(tgt_y_batch[i])
-        
-        # Create masks (1 for tokens, 0 for padding)
-        src_mask[i, 0, 0, :src_len] = 1
-        tgt_mask[i, 0, 0, :max_seq_len] = 1
-    # Move to device
-    if device_type == 'cuda':
-        # Pin arrays for asynchronous transfer
-        src_tensor = src_tensor.pin_memory().to(device, non_blocking=True)
-        tgt_tensor = tgt_tensor.pin_memory().to(device, non_blocking=True)
-        tgt_y_tensor = tgt_y_tensor.pin_memory().to(device, non_blocking=True)
-        src_mask = src_mask.pin_memory().to(device, non_blocking=True)
-        tgt_mask = tgt_mask.pin_memory().to(device, non_blocking=True)
-    else:
-        src_tensor = src_tensor.to(device)
-        tgt_tensor = tgt_tensor.to(device)
-        tgt_y_tensor = tgt_y_tensor.to(device)
-        src_mask = src_mask.to(device)
-        tgt_mask = tgt_mask.to(device)
-    print(src_tensor.shape, tgt_tensor.shape, tgt_y_tensor.shape, src_mask.shape, tgt_mask.shape)
-    return src_tensor, tgt_tensor, tgt_y_tensor, src_mask, tgt_mask
+    avg_loss = running_loss / len(dataloader)
+    print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
 
-# Loss estimation function
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_interval)
-        for k in range(eval_interval):
-            print(k)
-            src, tgt, tgt_y, src_mask, tgt_mask = get_batch(split)
-            _, loss = model.compute_loss(src, tgt, tgt_y, src_mask, tgt_mask)
-            losses[k] = loss.item()
-        out[split] = losses.mean().item()
-    model.train()
-    return out
-
-# Model initialization
-model_args = dict(
-    block_size=block_size,
-    vocab_size=vocab_size,
-    n_encoder_layer=n_encoder_layer,
-    n_decoder_layer=n_decoder_layer,
-    n_head=n_head,
-    n_embd=n_embd,
-    dropout=dropout,
-    bias=bias
+# --- Generation Sample ---
+# Use the first sample's encoder input to generate new text.
+sample_encoder_input_ids, _, _ = dataset[0]
+sample_encoder_input_ids = sample_encoder_input_ids.unsqueeze(0).to(device)  # add batch dimension
+print(sample_encoder_input_ids.shape)  # torch.Size([1, 10])
+print(tokenizer.decode(sample_encoder_input_ids.squeeze().to(device), skip_special_tokens=True))
+generated_ids = model.generate(
+    sample_encoder_input_ids,
+    torch.tensor([decoder_start_token_id]).to(device),
+    max_new_tokens=20
 )
 
-iter_num = 0
-best_val_loss = 1e9
-tokens_per_iter = gradient_accumulation_steps * batch_size * block_size
-print(f"Tokens per iteration will be: {tokens_per_iter:,}")
-training_losses = []
-validation_losses = []
-
-# Initialize or resume model
-if init_from == 'scratch':
-    config = ModelConfig(**model_args)
-    model = EncoderDecoder(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-# Handle block size mismatch
-if block_size < config.block_size:
-    print(f"Cropping block size from {config.block_size} to {block_size}")
-    # Implement a method similar to crop_block_size in your EncoderDecoder model if needed
-    # model.crop_block_size(block_size)
-    model_args['block_size'] = block_size
-    
-print(config)
-print(description)
-
-# Training loop
-if __name__ == "__main__":
-    print("Starting training")
-    
-    # Make sure output directories exist
-    os.makedirs(outdir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
-    
-    # Initialize progress tracking
-    start_time = time.time()
-    
-    for iter in range(iter_num, max_iters):
-        # Evaluate the model
-        if iter % eval_interval == 0 and iter > 0:
-            losses = estimate_loss()
-            print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            validation_losses.append(losses['val'])
-            
-            # Save best model
-            if best_val_loss > losses['val']:
-                best_val_loss = losses['val']
-                
-        src, tgt, tgt_y, src_mask, tgt_mask = get_batch('train')
-        if src_mask is not None and src_mask.dim() == 4:
-            # For encoder self-attention, we need [B, 1, T, T]
-            # We can expand the last dimension to T
-            B, _, _, T = src_mask.shape
-            src_mask = src_mask.squeeze(1).squeeze(1).unsqueeze(-2)  # [B, 1, T]
-            src_mask = src_mask.expand(-1, T, -1)  # [B, T, T]
-
-        if tgt_mask is not None and tgt_mask.dim() == 4:
-            # For decoder self-attention, we need [B, 1, T, T]
-            B, _, _, T = tgt_mask.shape
-            tgt_mask = tgt_mask.squeeze(1).squeeze(1).unsqueeze(-2)  # [B, 1, T]
-            tgt_mask = tgt_mask.expand(-1, T, -1)  # [B, T, T]
-
-        logits, loss = model.compute_loss(src, tgt, tgt_y, src_mask, tgt_mask)
-        
-        # Backward pass and optimization
-        optimizer.zero_grad(set_to_none=True)
-        print(loss.item())
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        # Print progress
-        if iter % 10 == 0:
-            print(f"Iteration {iter}: loss = {loss.item():.4f}")
-        
-        training_losses.append(loss.item())
-        
-    
-    
-    
-    # Generate an example translation
-    print("Generating sample translation:")
-    
-    # Example input (customize based on your data)
-    prompt = "Hello, how are you today?"
-    
-    # Tokenize input
-    src_tokens = torch.tensor([enc.encode(prompt) + [EOS_TOKEN_ID]], dtype=torch.long).to(device)
-    src_mask = torch.ones((1, 1, 1, src_tokens.size(1)), dtype=torch.bool).to(device)
-    
-    # Generate translation
-    generated = model.generate(
-        src_tokens, 
-        max_len=10, 
-        bos_token_id=BOS_TOKEN_ID, 
-        eos_token_id=EOS_TOKEN_ID, 
-        src_mask=src_mask
-    )
-    
-    # Decode the generated tokens
-    generated_text = enc.decode(generated[0].tolist())
-    print(f"Input: {prompt}")
-    print(f"Generated: {generated_text}")
-    
-    print(f"Training completed in {(time.time() - start_time)/60:.2f} minutes")
+# Decode generated IDs back to text.
+output_text = tokenizer.decode(generated_ids.squeeze().to(device), skip_special_tokens=True)
+print("Input (Author):", tokenizer.decode(sample_encoder_input_ids.squeeze().to(device), skip_special_tokens=True))
+print("Generated Text:", output_text)
