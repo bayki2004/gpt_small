@@ -1,4 +1,3 @@
-from transformers import BertModel
 import torch
 import numpy as np
 import torch.nn as nn
@@ -136,8 +135,8 @@ class Block(nn.Module):
 
 @dataclass
 class ModelConfig:
-    block_size: int = 32
-    vocab_size: int = 100278 #32128 # GPT-2 config.vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    block_size: int = 1024
+    vocab_size: int = 32128 # GPT-2 config.vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
