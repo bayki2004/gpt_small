@@ -73,7 +73,7 @@ def get_batch(split):
     return x, y
 def get_batch_pairs(split):
     if split=='train':
-        data = tt
+        data = train_memmap
     else:
         data = test_memmap
     ix = torch.randint(len(data), (1,))

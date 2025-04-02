@@ -16,7 +16,6 @@ class EncoderProjection(nn.Module):
     def forward(self, x):
         return self.proj(x)
 
-# Example: if your GPT-2 decoder uses 768 and t5_hidden_size is 512:
 if t5_hidden_size != 768:
     encoder_proj = EncoderProjection(t5_hidden_size, 768)
 else:
@@ -135,7 +134,7 @@ class Block(nn.Module):
 
 @dataclass
 class ModelConfig:
-    block_size: int = 1024
+    block_size: int = 512
     vocab_size: int = 32128 # GPT-2 config.vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -164,6 +163,7 @@ class EncoderDecoderModel(nn.Module):
         encoder_outputs = self.encoder(encoder_input_ids)
         encoder_hidden_states = encoder_outputs.last_hidden_state
         # Project if necessary
+        print(encoder_hidden_states.shape)
         encoder_hidden_states = self.encoder_proj(encoder_hidden_states)
         
         B, T = decoder_input_ids.shape

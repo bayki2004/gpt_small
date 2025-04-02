@@ -9,11 +9,12 @@ from transformers import T5Tokenizer
 # Assume config is defined as per your ModelConfig
 config = ModelConfig()  # defaults: block_size=1024, vocab_size=50304, n_layer=12, n_head=12, n_embd=768, dropout=0.0, bias=True
 init_from = 'scratch'
-config.block_size = 512
+config.block_size = 8
 num_epochs = 20
 batch_size = 8
 start_token_id = 101
 best_val_loss = 1e9
+save_checkpoint = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Instantiate the encoder-decoder model with your pretrained encoder (BERT)
 if init_from == 'scratch':
@@ -23,8 +24,6 @@ if init_from == 'scratch':
 
     model.train()
 if init_from == 'resume':
-    # Assume you saved your decoder-only model's state dict in 'decoder_state_dict.pth'
-
     saved_decoder_state = torch.load("models/lm_32_scratch_indices_end.pth", map_location=device)
 
     # Inspect the keys (for example purposes)
@@ -153,8 +152,9 @@ for epoch in range(num_epochs):
             "best_val_loss": best_val_loss,
             "model_config": config
         }
-        torch.save(checkpoint, "out/enc_dec_512_long.pt")
-        print("Checkpoint saved.")
+        if save_checkpoint:
+            torch.save(checkpoint, "out/enc_dec_512_long.pt")
+            print("Checkpoint saved.")
     print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.4f}")
 print("------------------")
 print("Training complete.")
@@ -165,7 +165,8 @@ checkpoint = {
             "best_val_loss": best_val_loss,
             "model_config": config
         }
-torch.save(checkpoint, "models/enc_dec_512_long.pt")
+if save_checkpoint:
+    torch.save(checkpoint, "models/enc_dec_512_long.pt")
 # --- Generation Sample (Optional) ---
 # Use the first sample's encoder input to generate new text.
 sample_encoder_input_ids, _, _ = train_dataset[0]
